@@ -1,4 +1,6 @@
-from tr2 import Tr2
+from fileinput import filename
+
+from tr2 import Tr2, load_words, dump_words
 
 if __name__ == '__main__':
     double00_tr2 = Tr2('tr2\\Double00.tr2')
@@ -20,3 +22,5 @@ if __name__ == '__main__':
     print(phrase_tr2.summary())
     # noinspection PyNoneFunctionAssignment
     print(puzzle_tr2.summary())
+    
+    dump_words('tr2\\Misc.tr2')

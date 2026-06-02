@@ -371,6 +371,12 @@ def load_words(path: str | Path = "Misc.tr2") -> list[dict[str, Any]]:
         for word_id in sorted(words)
     ]
 
+def dump_words(path: str | Path = "Misc.tr2") -> None:
+    import json
+
+    words = load_words(path)
+    with open("words.json", "w", encoding="utf-8") as f:
+        json.dump(words, f, ensure_ascii=False, indent=2)
 
 def TR2(path: str | Path) -> Tr2:
     return Tr2(path)
