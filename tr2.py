@@ -136,5 +136,5 @@ def load_words(path='Misc.tr2'):
     return [dict(id=k,term=words[k],yomi=yomi.get(k,''),single_hits=hits.get(k),
                  rank=RANK.get(rank.get(k),rank.get(k))) for k in sorted(words)]
 
-if __name__=='__main__':
-    for p in sys.argv[1:]: Tr2(p).summary(); print()
+def TR2(path):
+    return Tr2(path)
