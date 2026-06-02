@@ -1,5 +1,11 @@
 import unittest
 from pathlib import Path
+import sys
+
+project_root = Path(__file__).resolve().parent.parent
+
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
 
 from tr2 import Tr2
 
@@ -44,3 +50,7 @@ class TR2Tests(unittest.TestCase):
         with open(filename, 'rb') as f:
             file_data = f.read()
             return hashlib.sha256(file_data).hexdigest()
+
+
+if __name__ == "__main__":
+    unittest.main()
