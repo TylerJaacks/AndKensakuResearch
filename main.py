@@ -8,9 +8,15 @@ if __name__ == '__main__':
     phrase_tr2 = Tr2('tr2\\Phrase.tr2')
     puzzle_tr2 = Tr2('tr2\\Puzzle.tr2')
 
+    # noinspection PyNoneFunctionAssignment
     print(double00_tr2.summary())
+    # noinspection PyNoneFunctionAssignment
     print(double01_tr2.summary())
+    # noinspection PyNoneFunctionAssignment
     print(double02_tr2.summary())
+    # noinspection PyNoneFunctionAssignment
     print(misc_tr2.summary())
+    # noinspection PyNoneFunctionAssignment
     print(phrase_tr2.summary())
+    # noinspection PyNoneFunctionAssignment
     print(puzzle_tr2.summary())

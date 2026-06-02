@@ -2,139 +2,375 @@
 tr2.py - Parser + byte-exact rebuilder/editor for And-Kensaku (アンド検索, Wii)
 .tr2 word-data files.  LITTLE-ENDIAN throughout.
 
-Format (verified against Misc/Phrase/Puzzle/Double00-02 .tr2):
-  FILE HEADER 0x40 bytes: magic ".tr2"; u16 version@0x06; char[32] name@0x08;
-    u32 sectionTableOffset@0x38; u32 sectionCount@0x3c
-  SECTION TABLE: count * 20 bytes: u32 index, dataOffset(abs), headerSize(0x14),
-    size, size2(=size)
-  SECTION block: 0x80-byte header (name@0, "jajp"@0x30, "yobi8"@0x38,
-    elemType@0x40, u32 entryCount@0x7c), then index = entryCount * 12 bytes
-    (u32 id, u32 valueOffset[section-relative], u32 valueLength), then value
-    pool.  Strings: value bytes + 1 NUL separator (length EXCLUDES the NUL).
-    Scalars: packed at exactly the type width (no separator).
-  Element types: UTF-8, UTF-16LE, INT8/16/32, UINT8/16/32, FLOAT (and one
-    stray "INT" in Phrase/Puzzle, treated as INT32).
-
 Design for safe editing: each section keeps its ORIGINAL raw bytes. build()
-re-emits unmodified sections verbatim (guaranteeing byte-exact round-trip) and
-only re-serializes sections you actually edit (sec.dirty=True), recomputing the
-index/value-pool/offsets for those.
+re-emits unmodified sections verbatim and only re-serializes sections you edit.
 """
-import struct, sys
 
-def _u16(d,o): return struct.unpack_from('<H',d,o)[0]
-def _u32(d,o): return struct.unpack_from('<I',d,o)[0]
+from __future__ import annotations
 
-_SCALAR = {'INT8':(1,'<b'),'UINT8':(1,'<B'),'INT16':(2,'<h'),'UINT16':(2,'<H'),
-           'INT32':(4,'<i'),'UINT32':(4,'<I'),'FLOAT':(4,'<f'),'INT':(4,'<i')}
+import struct
+from pathlib import Path
+from typing import Any, TypeAlias
+
+FILE_HEADER_SIZE = 0x40
+SECTION_HEADER_SIZE = 0x80
+SECTION_TABLE_ENTRY_SIZE = 20
+SECTION_TABLE_HEADER_SIZE = 0x14
+SECTION_COUNT_OFFSET = 0x3C
+SECTION_TABLE_OFFSET = 0x38
+VERSION_OFFSET = 0x06
+FILE_NAME_OFFSET = 0x08
+FILE_NAME_SIZE = 32
+SECTION_NAME_SIZE = 32
+SECTION_TYPE_OFFSET = 0x40
+SECTION_TYPE_SIZE = 16
+SECTION_ENTRY_COUNT_OFFSET = 0x7C
+SECTION_INDEX_ENTRY_SIZE = 12
+
+TR2_MAGIC = b".tr2"
+ASCII_ENCODING = "ascii"
+UTF8_TYPE = "UTF-8"
+UTF16LE_TYPE = "UTF-16LE"
+UTF16LE_ENCODING = "utf-16-le"
+DECODE_ERRORS = "replace"
+
+Entry: TypeAlias = list[Any]
+SectionMeta: TypeAlias = tuple[int, int, int, int, int]
+ScalarSpec: TypeAlias = tuple[int, str]
+
+_SCALAR_TYPES: dict[str, ScalarSpec] = {
+    "INT8": (1, "<b"),
+    "UINT8": (1, "<B"),
+    "INT16": (2, "<h"),
+    "UINT16": (2, "<H"),
+    "INT32": (4, "<i"),
+    "UINT32": (4, "<I"),
+    "FLOAT": (4, "<f"),
+    "INT": (4, "<i"),
+}
+DEFAULT_SCALAR: ScalarSpec = (4, "<i")
+
+WORD_RANK_LABELS = {
+    0: "S",
+    1: "A",
+    2: "B",
+    3: "C",
+    4: "D",
+    5: "E",
+}
+
+
+def _u16(data: bytes | bytearray, offset: int) -> int:
+    return struct.unpack_from("<H", data, offset)[0]
+
+
+def _u32(data: bytes | bytearray, offset: int) -> int:
+    return struct.unpack_from("<I", data, offset)[0]
+
+
+def _decode_c_string(
+        data: bytes | bytearray,
+        offset: int,
+        size: int,
+        encoding: str = ASCII_ENCODING,
+) -> str:
+    raw_value = data[offset: offset + size].split(b"\0", 1)[0]
+    return raw_value.decode(encoding, DECODE_ERRORS)
+
+
+def _read_file(path: str | Path) -> bytes:
+    with open(path, "rb") as file:
+        return file.read()
+
+
+def _write_file(path: str | Path, data: bytes) -> None:
+    with open(path, "wb") as file:
+        file.write(data)
+
 
 class Section:
-    def __init__(self, name, etype):
-        self.name=name; self.etype=etype
-        self.entries=[]            # list of [id, value]  (value: str or number)
-        self._raw_header=None      # 0x80 bytes, preserved
-        self._raw_body=None        # original index+pool bytes, preserved
-        self.dirty=False           # set True after you modify .entries
-    def is_str(self): return self.etype.startswith('UTF')
-    def set_value(self, rid, value):
-        for e in self.entries:
-            if e[0]==rid: e[1]=value; self.dirty=True; return
-        self.entries.append([rid,value]); self.entries.sort(key=lambda e:e[0]); self.dirty=True
-    def delete(self, rid):
-        self.entries=[e for e in self.entries if e[0]!=rid]; self.dirty=True
+    def __init__(self, name: str, element_type: str):
+        self.name = name
+        self.etype = element_type
+        self.entries: list[Entry] = []
+        self._raw_header: bytes | None = None
+        self._raw_body: bytes | None = None
+        self.dirty = False
+
+    def is_str(self) -> bool:
+        return self.etype.startswith("UTF")
+
+    def set_value(self, entry_id: int, value: Any) -> None:
+        for entry in self.entries:
+            if entry[0] == entry_id:
+                entry[1] = value
+                self.dirty = True
+                return
+
+        self.entries.append([entry_id, value])
+        self.entries.sort(key=lambda e: e[0])
+        self.dirty = True
+
+    def delete(self, entry_id: int) -> None:
+        self.entries = [entry for entry in self.entries if entry[0] != entry_id]
+        self.dirty = True
+
+    @property
+    def raw_header(self):
+        return self._raw_header
+
+    @property
+    def raw_body(self):
+        return self._raw_body
+
+
+def _write_section_table(
+        output: bytearray,
+        table_position: int,
+        section_meta: list[SectionMeta],
+) -> None:
+    offset = table_position
+
+    for section_index, section_offset, header_size, size, size2 in section_meta:
+        struct.pack_into(
+            "<IIIII",
+            output,
+            offset,
+            section_index,
+            section_offset,
+            header_size,
+            size,
+            size2,
+        )
+        offset += SECTION_TABLE_ENTRY_SIZE
+
+
+def _encode_value(element_type: str, value: Any) -> tuple[bytes, int]:
+    if element_type == UTF8_TYPE:
+        encoded = value.encode("utf-8")
+        return encoded + b"\x00", len(encoded)
+
+    if element_type == UTF16LE_TYPE:
+        encoded = value.encode(UTF16LE_ENCODING)
+        return encoded + b"\x00", len(encoded)
+
+    scalar_width, scalar_format = _SCALAR_TYPES.get(element_type, DEFAULT_SCALAR)
+    return struct.pack(scalar_format, value), scalar_width
+
+
+# noinspection PyTypeChecker
+def _section_bytes(section: Section) -> bytes:
+    if not section.dirty and section._raw_body is not None:
+        return bytes(section.raw_header) + bytes(section.raw_body)
+
+    if section.raw_header is None:
+        raise ValueError(f"Section {section.name!r} has no raw header to rebuild from.")
+
+    section.entries.sort(key=lambda entry: entry[0])
+
+    header = bytearray(section.raw_header)
+    struct.pack_into("<I", header, SECTION_ENTRY_COUNT_OFFSET, len(section.entries))
+
+    index = bytearray()
+    value_pool = bytearray()
+    value_pool_base = SECTION_HEADER_SIZE + SECTION_INDEX_ENTRY_SIZE * len(section.entries)
+
+    for entry_id, value in section.entries:
+        value_offset = value_pool_base + len(value_pool)
+        encoded_value, value_length = _encode_value(section.etype, value)
+        value_pool += encoded_value
+        index += struct.pack("<III", entry_id, value_offset, value_length)
+
+    return bytes(header) + bytes(index) + bytes(value_pool)
+
 
 class Tr2:
-    def __init__(self, path=None, data=None):
-        if data is None: data=open(path,'rb').read()
-        self.path=path; self.d=data
-        assert self.d[:4]==b'.tr2','bad magic'
-        self.version=_u16(self.d,6)
-        self.name=self.d[8:40].split(b'\0')[0].decode('ascii','replace')
-        self._sec_off=_u32(self.d,0x38); self._sec_count=_u32(self.d,0x3c)
-        self._file_header=self.d[:0x40]
-        self.sections=[]; self._sec_meta=[]
+    def __init__(self, path: str | Path | None = None, data: bytes | None = None):
+        if data is None:
+            if path is None:
+                raise ValueError("Either path or data must be provided.")
+            data = _read_file(path)
+
+        self.path = path
+        self.d = data
+
+        if self.d[:4] != TR2_MAGIC:
+            raise ValueError("bad magic")
+
+        self.version = _u16(self.d, VERSION_OFFSET)
+        self.name = _decode_c_string(self.d, FILE_NAME_OFFSET, FILE_NAME_SIZE)
+        self._sec_off = _u32(self.d, SECTION_TABLE_OFFSET)
+        self._sec_count = _u32(self.d, SECTION_COUNT_OFFSET)
+        self._file_header = self.d[:FILE_HEADER_SIZE]
+        self.sections: list[Section] = []
+        self._sec_meta: list[SectionMeta] = []
+
         self._parse()
 
-    def _parse(self):
-        d=self.d; o=self._sec_off
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Tr2):
+            return NotImplemented
+
+        return self.build() == other.build()
+
+    def _parse(self) -> None:
+        self._sec_meta = self._parse_section_table()
+
+        for section_meta in self._sec_meta:
+            section = self._parse_section(section_meta)
+            self.sections.append(section)
+
+    def _parse_section_table(self) -> list[SectionMeta]:
+        section_table: list[SectionMeta] = []
+        offset = self._sec_off
+
         for _ in range(self._sec_count):
-            self._sec_meta.append((_u32(d,o),_u32(d,o+4),_u32(d,o+8),_u32(d,o+12),_u32(d,o+16))); o+=20
-        for (idx,off,hsz,size,size2) in self._sec_meta:
-            name=d[off:off+32].split(b'\0')[0].decode('ascii','replace')
-            et=d[off+0x40:off+0x50].split(b'\0')[0].decode('ascii','replace')
-            sec=Section(name,et)
-            sec._raw_header=d[off:off+0x80]
-            sec._raw_body=d[off+0x80:off+size]
-            count=_u32(d,off+0x7c); p=off+0x80
-            for i in range(count):
-                rid=_u32(d,p); voff=_u32(d,p+4); vlen=_u32(d,p+8); p+=12
-                vp=off+voff
-                if et=='UTF-8': val=d[vp:vp+vlen].decode('utf-8','replace')
-                elif et=='UTF-16LE': val=d[vp:vp+vlen].decode('utf-16-le','replace')
-                else:
-                    w,fmt=_SCALAR.get(et,(4,'<i')); val=struct.unpack_from(fmt,d,vp)[0]
-                sec.entries.append([rid,val])
-            self.sections.append(sec)
+            section_table.append(
+                (
+                    _u32(self.d, offset),
+                    _u32(self.d, offset + 4),
+                    _u32(self.d, offset + 8),
+                    _u32(self.d, offset + 12),
+                    _u32(self.d, offset + 16),
+                )
+            )
+            offset += SECTION_TABLE_ENTRY_SIZE
 
-    def get(self,name):
-        for s in self.sections:
-            if s.name==name: return s
+        return section_table
+
+    def _parse_section(self, section_meta: SectionMeta) -> Section:
+        _, section_offset, _, section_size, _ = section_meta
+
+        section_name = _decode_c_string(
+            self.d,
+            section_offset,
+            SECTION_NAME_SIZE,
+        )
+        element_type = _decode_c_string(
+            self.d,
+            section_offset + SECTION_TYPE_OFFSET,
+            SECTION_TYPE_SIZE,
+        )
+
+        section = Section(section_name, element_type)
+        section._raw_header = self.d[section_offset: section_offset + SECTION_HEADER_SIZE]
+        section._raw_body = self.d[section_offset + SECTION_HEADER_SIZE: section_offset + section_size]
+
+        entry_count = _u32(self.d, section_offset + SECTION_ENTRY_COUNT_OFFSET)
+        index_offset = section_offset + SECTION_HEADER_SIZE
+
+        for _ in range(entry_count):
+            entry_id = _u32(self.d, index_offset)
+            value_offset = _u32(self.d, index_offset + 4)
+            value_length = _u32(self.d, index_offset + 8)
+            index_offset += SECTION_INDEX_ENTRY_SIZE
+
+            value = self._decode_value(
+                element_type,
+                section_offset + value_offset,
+                value_length,
+            )
+            section.entries.append([entry_id, value])
+
+        return section
+
+    def _decode_value(self, element_type: str, value_offset: int, value_length: int) -> Any:
+        if element_type == UTF8_TYPE:
+            return self.d[value_offset: value_offset + value_length].decode(
+                "utf-8",
+                DECODE_ERRORS,
+            )
+
+        if element_type == UTF16LE_TYPE:
+            return self.d[value_offset: value_offset + value_length].decode(
+                UTF16LE_ENCODING,
+                DECODE_ERRORS,
+            )
+
+        _, scalar_format = _SCALAR_TYPES.get(element_type, DEFAULT_SCALAR)
+        return struct.unpack_from(scalar_format, self.d, value_offset)[0]
+
+    @staticmethod
+    def _pad_to_offset(output: bytearray, target_offset: int) -> None:
+        if len(output) < target_offset:
+            output += b"\x00" * (target_offset - len(output))
+
+    def get(self, name: str) -> Section:
+        for section in self.sections:
+            if section.name == name:
+                return section
+
         raise KeyError(name)
-    def read(self,name): return {rid:val for rid,val in self.get(name).entries}
 
-    # ---- rebuild ----
-    def _section_bytes(self, sec):
-        if not sec.dirty and sec._raw_body is not None:
-            return bytes(sec._raw_header)+bytes(sec._raw_body)   # verbatim
-        # re-serialize edited section
-        et=sec.etype; n=len(sec.entries)
-        header=bytearray(sec._raw_header); struct.pack_into('<I',header,0x7c,n)
-        sec.entries.sort(key=lambda e:e[0])
-        index=bytearray(); pool=bytearray(); pool_base=0x80+12*n
-        for (rid,val) in sec.entries:
-            voff=pool_base+len(pool)
-            if et=='UTF-8':
-                b=val.encode('utf-8'); vlen=len(b); pool+=b+b'\x00'
-            elif et=='UTF-16LE':
-                b=val.encode('utf-16-le'); vlen=len(b); pool+=b+b'\x00'
-            else:
-                w,fmt=_SCALAR.get(et,(4,'<i')); b=struct.pack(fmt,val); vlen=w; pool+=b
-            index+=struct.pack('<III',rid,voff,vlen)
-        return bytes(header)+bytes(index)+bytes(pool)
+    def read(self, name: str) -> dict[int, Any]:
+        return {entry_id: value for entry_id, value in self.get(name).entries}
 
-    def build(self):
-        out=bytearray(self._file_header)
-        sec_table_off=self._sec_off
-        if len(out)<sec_table_off: out+=b'\x00'*(sec_table_off-len(out))
-        table_pos=len(out); out+=b'\x00'*(20*len(self.sections))
-        meta=[]
-        for si,sec in enumerate(self.sections):
-            target=self._sec_meta[si][1]           # original dataOffset
-            # Only honor original offset if nothing earlier grew. Pad to it when possible.
-            if len(out)<target: out+=b'\x00'*(target-len(out))
-            sec_off=len(out)
-            block=self._section_bytes(sec); out+=block
-            meta.append((self._sec_meta[si][0],sec_off,0x14,len(block),len(block)))
-        tp=table_pos
-        for (idx,off,hsz,size,size2) in meta:
-            struct.pack_into('<IIIII',out,tp,idx,off,hsz,size,size2); tp+=20
-        # pad to original length if we ended short and nothing was edited bigger
+    def build(self) -> bytes:
+        output = bytearray(self._file_header)
+
+        self._pad_to_offset(output, self._sec_off)
+
+        section_table_position = len(output)
+        output += b"\x00" * (SECTION_TABLE_ENTRY_SIZE * len(self.sections))
+
+        rebuilt_meta = []
+
+        for section_index, section in enumerate(self.sections):
+            original_section_offset = self._sec_meta[section_index][1]
+            self._pad_to_offset(output, original_section_offset)
+
+            section_offset = len(output)
+            section_block = _section_bytes(section)
+            output += section_block
+
+            original_section_index = self._sec_meta[section_index][0]
+            rebuilt_meta.append(
+                (
+                    original_section_index,
+                    section_offset,
+                    SECTION_TABLE_HEADER_SIZE,
+                    len(section_block),
+                    len(section_block),
+                )
+            )
+
+        _write_section_table(output, section_table_position, rebuilt_meta)
+
         if self.path:
-            orig_len=len(self.d)
-            if len(out)<orig_len: out+=b'\x00'*(orig_len-len(out))
-        return bytes(out)
+            self._pad_to_offset(output, len(self.d))
 
-    def save(self,path): open(path,'wb').write(self.build())
-    def summary(self):
-        print(f'== {self.path} name={self.name!r} sections={len(self.sections)} ==')
-        for s in self.sections: print(f'  {s.name:34s} {s.etype:9s} entries={len(s.entries)}')
+        return bytes(output)
 
-def load_words(path='Misc.tr2'):
-    t=Tr2(path); words=t.read('WordList'); yomi=t.read('YOMI')
-    hits=t.read('SINGLEHITS'); rank=t.read('WORD_RANK')
-    RANK={0:'S',1:'A',2:'B',3:'C',4:'D',5:'E'}
-    return [dict(id=k,term=words[k],yomi=yomi.get(k,''),single_hits=hits.get(k),
-                 rank=RANK.get(rank.get(k),rank.get(k))) for k in sorted(words)]
+    def save(self, path: str | Path) -> None:
+        _write_file(path, self.build())
 
-def TR2(path):
+    def summary(self) -> None:
+        print(f"== {self.path} name={self.name!r} sections={len(self.sections)} ==")
+
+        for section in self.sections:
+            print(f"  {section.name:34s} {section.etype:9s} entries={len(section.entries)}")
+
+
+# noinspection PyTypeChecker
+def load_words(path: str | Path = "Misc.tr2") -> list[dict[str, Any]]:
+    tr2_file = Tr2(path)
+
+    words = tr2_file.read("WordList")
+    yomi = tr2_file.read("YOMI")
+    hits = tr2_file.read("SINGLEHITS")
+    ranks: dict[int, Any] = tr2_file.read("WORD_RANK")
+
+    return [
+        {
+            "id": word_id,
+            "term": words[word_id],
+            "yomi": yomi.get(word_id, ""),
+            "single_hits": hits.get(word_id),
+            "rank": WORD_RANK_LABELS.get(ranks.get(word_id), ranks.get(word_id)),
+        }
+        for word_id in sorted(words)
+    ]
+
+
+def TR2(path: str | Path) -> Tr2:
     return Tr2(path)

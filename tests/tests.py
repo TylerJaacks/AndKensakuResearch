@@ -25,6 +25,8 @@ class TR2Tests(unittest.TestCase):
 
         # Compare the hashes to ensure they are identical.
         self.assertEqual(original_hash, copied_hash, "The original and copied TR2 files do not match.")
+        # Compare the original and copied TR2 objects for equality.
+        self.assertTrue(original_tr2.__eq__(copied_tr2), "The original and copied TR2 objects are not equal.")
 
         # Clean up the copied file after the test.
         copied_path.unlink()
