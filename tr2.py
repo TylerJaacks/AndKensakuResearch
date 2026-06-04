@@ -1,382 +1,408 @@
 """
-tr2.py - Parser + byte-exact rebuilder/editor for And-Kensaku (アンド検索, Wii)
-.tr2 word-data files.  LITTLE-ENDIAN throughout.
+tr2.py — Parser, editor, and writer for And-Kensaku (安藤ケンサク / アンド検索, Wii)
+``.tr2`` word-data files.
 
-Design for safe editing: each section keeps its ORIGINAL raw bytes. build()
-re-emits unmodified sections verbatim and only re-serializes sections you edit.
+The ``.tr2`` container is a flat collection of named *sections*. Every section
+holds an array of ``(id, value)`` entries; ids are sparse 32-bit integers and
+need not be contiguous. Values are either text (UTF-8 or UTF-16LE) or fixed
+scalars (ints / floats). Despite the game targeting big-endian PowerPC, the
+container's own integer fields are **little-endian**.
+
+Layout
+------
+File header           0x00, 0x40 bytes
+  +0x00  magic  ".tr2"
+  +0x06  u16    version
+  +0x08  char[32] file name (NUL-padded)
+  +0x38  u32    section-table offset
+  +0x3C  u32    section count
+
+Section table         (at the offset above) — one 20-byte record per section:
+  u32 index, u32 offset, u32 header_size, u32 size, u32 size2
+  (header_size is always 0x14; size == size2 == the section's total byte length)
+
+Section                (at each record's offset)
+  +0x00  char[32] section name
+  +0x40  char[16] element type ("UTF-8", "UTF-16LE", "INT32", "FLOAT", ...)
+  +0x7C  u32      entry count
+  0x80   index    entry_count * (u32 id, u32 value_offset, u32 value_length)
+                  value_offset is relative to the section start; value_length
+                  is the byte length of the value *excluding* its terminator.
+  ...    value pool (the bytes the index points into)
+
+Editing model
+-------------
+Parsing keeps each section's original raw bytes. :meth:`Tr2.build` re-emits any
+section you did *not* touch verbatim, and only re-serialises the ones you edited
+(``section.dirty``). An untouched file therefore rebuilds byte-for-byte
+identically to the input. Edited sections are laid out as
+``[header][index][value pool]`` with offsets/lengths/count recomputed.
+
+Typical use
+-----------
+    t = Tr2("Misc.tr2")
+    t.set("WordList", 29, "新しい単語")     # change one entry's text
+    t.set("YOMI",     29, "あたらしいたんご")
+    t.save("Misc_edited.tr2")
+
+    # bulk edit
+    wl = t.get("WordList")
+    for entry_id in t.ids("WordList"):
+        wl.set_value(entry_id, "test")
+
+    # create a brand-new file from an existing template's structure
+    t2 = Tr2.from_template("Misc.tr2")   # same sections/types, cleared entries
+    t2.get("WordList").set_value(1, "hello")
 """
 
 from __future__ import annotations
 
 import struct
 from pathlib import Path
-from typing import Any, TypeAlias
+from typing import Any, Iterable, Iterator
+
+# ---------------------------------------------------------------------------
+# Container constants (all integer fields little-endian)
+# ---------------------------------------------------------------------------
+MAGIC = b".tr2"
 
 FILE_HEADER_SIZE = 0x40
-SECTION_HEADER_SIZE = 0x80
-SECTION_TABLE_ENTRY_SIZE = 20
-SECTION_TABLE_HEADER_SIZE = 0x14
-SECTION_COUNT_OFFSET = 0x3C
-SECTION_TABLE_OFFSET = 0x38
 VERSION_OFFSET = 0x06
 FILE_NAME_OFFSET = 0x08
 FILE_NAME_SIZE = 32
+SECTION_TABLE_OFFSET_FIELD = 0x38
+SECTION_COUNT_FIELD = 0x3C
+
+SECTION_TABLE_ENTRY_SIZE = 20
+SECTION_TABLE_HEADER_SIZE = 0x14   # constant stored in field 3 of each record
+
+SECTION_HEADER_SIZE = 0x80
 SECTION_NAME_SIZE = 32
 SECTION_TYPE_OFFSET = 0x40
 SECTION_TYPE_SIZE = 16
 SECTION_ENTRY_COUNT_OFFSET = 0x7C
 SECTION_INDEX_ENTRY_SIZE = 12
 
-TR2_MAGIC = b".tr2"
-ASCII_ENCODING = "ascii"
 UTF8_TYPE = "UTF-8"
 UTF16LE_TYPE = "UTF-16LE"
-UTF16LE_ENCODING = "utf-16-le"
-DECODE_ERRORS = "replace"
+_UTF16LE_ENCODING = "utf-16-le"
+_DECODE_ERRORS = "replace"
 
-Entry: TypeAlias = list[Any]
-SectionMeta: TypeAlias = tuple[int, int, int, int, int]
-ScalarSpec: TypeAlias = tuple[int, str]
-
-_SCALAR_TYPES: dict[str, ScalarSpec] = {
+# element type -> (byte width, struct format) for scalar sections
+_SCALAR_TYPES: dict[str, tuple[int, str]] = {
     "INT8": (1, "<b"),
     "UINT8": (1, "<B"),
     "INT16": (2, "<h"),
     "UINT16": (2, "<H"),
     "INT32": (4, "<i"),
     "UINT32": (4, "<I"),
-    "FLOAT": (4, "<f"),
     "INT": (4, "<i"),
+    "FLOAT": (4, "<f"),
 }
-DEFAULT_SCALAR: ScalarSpec = (4, "<i")
+_DEFAULT_SCALAR = (4, "<i")
 
-WORD_RANK_LABELS = {
-    0: "S",
-    1: "A",
-    2: "B",
-    3: "C",
-    4: "D",
-    5: "E",
-}
+# Convenience mapping seen in Misc.tr2's WORD_RANK section.
+WORD_RANK_LABELS = {0: "S", 1: "A", 2: "B", 3: "C", 4: "D", 5: "E"}
 
 
-def _u16(data: bytes | bytearray, offset: int) -> int:
+# ---------------------------------------------------------------------------
+# Small byte helpers
+# ---------------------------------------------------------------------------
+def _u16(data: bytes, offset: int) -> int:
     return struct.unpack_from("<H", data, offset)[0]
 
 
-def _u32(data: bytes | bytearray, offset: int) -> int:
+def _u32(data: bytes, offset: int) -> int:
     return struct.unpack_from("<I", data, offset)[0]
 
 
-def _decode_c_string(
-        data: bytes | bytearray,
-        offset: int,
-        size: int,
-        encoding: str = ASCII_ENCODING,
-) -> str:
-    raw_value = data[offset: offset + size].split(b"\0", 1)[0]
-    return raw_value.decode(encoding, DECODE_ERRORS)
+def _read_cstring(data: bytes, offset: int, size: int, encoding: str = "ascii") -> str:
+    raw = data[offset:offset + size].split(b"\x00", 1)[0]
+    return raw.decode(encoding, _DECODE_ERRORS)
 
 
-def _read_file(path: str | Path) -> bytes:
-    with open(path, "rb") as file:
-        return file.read()
+def _is_text_type(element_type: str) -> bool:
+    return element_type.startswith("UTF")
 
 
-def _write_file(path: str | Path, data: bytes) -> None:
-    with open(path, "wb") as file:
-        file.write(data)
+def _encode_value(element_type: str, value: Any) -> tuple[bytes, int]:
+    """Return (bytes-including-terminator, content-length-without-terminator)."""
+    if element_type == UTF8_TYPE:
+        encoded = value.encode("utf-8")
+        return encoded + b"\x00", len(encoded)
+    if element_type == UTF16LE_TYPE:
+        encoded = value.encode(_UTF16LE_ENCODING)
+        # game stores a single trailing NUL byte after UTF-16LE values
+        return encoded + b"\x00", len(encoded)
+    width, fmt = _SCALAR_TYPES.get(element_type, _DEFAULT_SCALAR)
+    return struct.pack(fmt, value), width
 
 
+def _decode_value(data: bytes, element_type: str, value_offset: int, value_length: int) -> Any:
+    if element_type == UTF8_TYPE:
+        return data[value_offset:value_offset + value_length].decode("utf-8", _DECODE_ERRORS)
+    if element_type == UTF16LE_TYPE:
+        return data[value_offset:value_offset + value_length].decode(_UTF16LE_ENCODING, _DECODE_ERRORS)
+    _, fmt = _SCALAR_TYPES.get(element_type, _DEFAULT_SCALAR)
+    return struct.unpack_from(fmt, data, value_offset)[0]
+
+
+# ---------------------------------------------------------------------------
+# Section
+# ---------------------------------------------------------------------------
 class Section:
+    """One named array of ``(id, value)`` entries inside a :class:`Tr2`."""
+
     def __init__(self, name: str, element_type: str):
         self.name = name
         self.etype = element_type
-        self.entries: list[Entry] = []
+        self.entries: list[list] = []          # list of [id, value]
         self._raw_header: bytes | None = None
         self._raw_body: bytes | None = None
         self.dirty = False
 
-    def is_str(self) -> bool:
-        return self.etype.startswith("UTF")
+    # -- queries ----------------------------------------------------------
+    def is_text(self) -> bool:
+        return _is_text_type(self.etype)
 
+    def ids(self) -> list[int]:
+        return [e[0] for e in self.entries]
+
+    def has(self, entry_id: int) -> bool:
+        return any(e[0] == entry_id for e in self.entries)
+
+    def value(self, entry_id: int, default: Any = None) -> Any:
+        for e in self.entries:
+            if e[0] == entry_id:
+                return e[1]
+        return default
+
+    def as_dict(self) -> dict[int, Any]:
+        return {e[0]: e[1] for e in self.entries}
+
+    # -- mutation ---------------------------------------------------------
     def set_value(self, entry_id: int, value: Any) -> None:
-        for entry in self.entries:
-            if entry[0] == entry_id:
-                entry[1] = value
+        """Set (or insert) ``entry_id``'s value. Marks the section dirty."""
+        for e in self.entries:
+            if e[0] == entry_id:
+                e[1] = value
                 self.dirty = True
                 return
-
         self.entries.append([entry_id, value])
         self.entries.sort(key=lambda e: e[0])
         self.dirty = True
 
     def delete(self, entry_id: int) -> None:
-        self.entries = [entry for entry in self.entries if entry[0] != entry_id]
+        before = len(self.entries)
+        self.entries = [e for e in self.entries if e[0] != entry_id]
+        if len(self.entries) != before:
+            self.dirty = True
+
+    def map_values(self, func) -> None:
+        """Apply ``func(id, value) -> new_value`` to every entry."""
+        for e in self.entries:
+            e[1] = func(e[0], e[1])
         self.dirty = True
 
-    @property
-    def raw_header(self):
-        return self._raw_header
+    # -- serialisation ----------------------------------------------------
+    def to_bytes(self) -> bytes:
+        if not self.dirty and self._raw_body is not None and self._raw_header is not None:
+            return self._raw_header + self._raw_body
+        if self._raw_header is None:
+            raise ValueError(f"section {self.name!r} has no header template to rebuild from")
 
-    @property
-    def raw_body(self):
-        return self._raw_body
+        self.entries.sort(key=lambda e: e[0])
 
+        header = bytearray(self._raw_header)
+        struct.pack_into("<I", header, SECTION_ENTRY_COUNT_OFFSET, len(self.entries))
 
-def _write_section_table(
-        output: bytearray,
-        table_position: int,
-        section_meta: list[SectionMeta],
-) -> None:
-    offset = table_position
+        index = bytearray()
+        pool = bytearray()
+        pool_base = SECTION_HEADER_SIZE + SECTION_INDEX_ENTRY_SIZE * len(self.entries)
 
-    for section_index, section_offset, header_size, size, size2 in section_meta:
-        struct.pack_into(
-            "<IIIII",
-            output,
-            offset,
-            section_index,
-            section_offset,
-            header_size,
-            size,
-            size2,
-        )
-        offset += SECTION_TABLE_ENTRY_SIZE
+        for entry_id, value in self.entries:
+            value_offset = pool_base + len(pool)
+            encoded, length = _encode_value(self.etype, value)
+            pool += encoded
+            index += struct.pack("<III", entry_id, value_offset, length)
+
+        return bytes(header) + bytes(index) + bytes(pool)
+
+    def __repr__(self) -> str:
+        return f"<Section {self.name!r} {self.etype} entries={len(self.entries)}>"
 
 
-def _encode_value(element_type: str, value: Any) -> tuple[bytes, int]:
-    if element_type == UTF8_TYPE:
-        encoded = value.encode("utf-8")
-        return encoded + b"\x00", len(encoded)
-
-    if element_type == UTF16LE_TYPE:
-        encoded = value.encode(UTF16LE_ENCODING)
-        return encoded + b"\x00", len(encoded)
-
-    scalar_width, scalar_format = _SCALAR_TYPES.get(element_type, DEFAULT_SCALAR)
-    return struct.pack(scalar_format, value), scalar_width
-
-
-# noinspection PyTypeChecker
-def _section_bytes(section: Section) -> bytes:
-    if not section.dirty and section._raw_body is not None:
-        return bytes(section.raw_header) + bytes(section.raw_body)
-
-    if section.raw_header is None:
-        raise ValueError(f"Section {section.name!r} has no raw header to rebuild from.")
-
-    section.entries.sort(key=lambda entry: entry[0])
-
-    header = bytearray(section.raw_header)
-    struct.pack_into("<I", header, SECTION_ENTRY_COUNT_OFFSET, len(section.entries))
-
-    index = bytearray()
-    value_pool = bytearray()
-    value_pool_base = SECTION_HEADER_SIZE + SECTION_INDEX_ENTRY_SIZE * len(section.entries)
-
-    for entry_id, value in section.entries:
-        value_offset = value_pool_base + len(value_pool)
-        encoded_value, value_length = _encode_value(section.etype, value)
-        value_pool += encoded_value
-        index += struct.pack("<III", entry_id, value_offset, value_length)
-
-    return bytes(header) + bytes(index) + bytes(value_pool)
-
-
+# ---------------------------------------------------------------------------
+# Tr2
+# ---------------------------------------------------------------------------
 class Tr2:
-    def __init__(self, path: str | Path | None = None, data: bytes | None = None):
+    """A parsed ``.tr2`` file you can read, edit, and write back."""
+
+    def __init__(self, path: str | Path | None = None, *, data: bytes | None = None):
         if data is None:
             if path is None:
-                raise ValueError("Either path or data must be provided.")
-            data = _read_file(path)
+                raise ValueError("provide either path or data=")
+            data = Path(path).read_bytes()
+        if data[:4] != MAGIC:
+            raise ValueError("not a .tr2 file (bad magic)")
 
         self.path = path
-        self.d = data
-
-        if self.d[:4] != TR2_MAGIC:
-            raise ValueError("bad magic")
-
-        self.version = _u16(self.d, VERSION_OFFSET)
-        self.name = _decode_c_string(self.d, FILE_NAME_OFFSET, FILE_NAME_SIZE)
-        self._sec_off = _u32(self.d, SECTION_TABLE_OFFSET)
-        self._sec_count = _u32(self.d, SECTION_COUNT_OFFSET)
-        self._file_header = self.d[:FILE_HEADER_SIZE]
+        self._original = data
+        self.version = _u16(data, VERSION_OFFSET)
+        self.name = _read_cstring(data, FILE_NAME_OFFSET, FILE_NAME_SIZE)
+        self._file_header = data[:FILE_HEADER_SIZE]
+        self._table_offset = _u32(data, SECTION_TABLE_OFFSET_FIELD)
+        self._section_count = _u32(data, SECTION_COUNT_FIELD)
         self.sections: list[Section] = []
-        self._sec_meta: list[SectionMeta] = []
+        # original (index, offset) per section, to preserve placement on rebuild
+        self._orig_meta: list[tuple[int, int]] = []
+        self._parse(data)
 
-        self._parse()
-
-    def __eq__(self, other: object) -> bool:
-        if not isinstance(other, Tr2):
-            return NotImplemented
-
-        return self.build() == other.build()
-
-    def _parse(self) -> None:
-        self._sec_meta = self._parse_section_table()
-
-        for section_meta in self._sec_meta:
-            section = self._parse_section(section_meta)
-            self.sections.append(section)
-
-    def _parse_section_table(self) -> list[SectionMeta]:
-        section_table: list[SectionMeta] = []
-        offset = self._sec_off
-
-        for _ in range(self._sec_count):
-            section_table.append(
-                (
-                    _u32(self.d, offset),
-                    _u32(self.d, offset + 4),
-                    _u32(self.d, offset + 8),
-                    _u32(self.d, offset + 12),
-                    _u32(self.d, offset + 16),
-                )
-            )
+    # -- parsing ----------------------------------------------------------
+    def _parse(self, data: bytes) -> None:
+        offset = self._table_offset
+        records = []
+        for _ in range(self._section_count):
+            index = _u32(data, offset)
+            sec_off = _u32(data, offset + 4)
+            size = _u32(data, offset + 12)
+            records.append((index, sec_off, size))
             offset += SECTION_TABLE_ENTRY_SIZE
 
-        return section_table
+        for index, sec_off, size in records:
+            name = _read_cstring(data, sec_off, SECTION_NAME_SIZE)
+            etype = _read_cstring(data, sec_off + SECTION_TYPE_OFFSET, SECTION_TYPE_SIZE)
+            sec = Section(name, etype)
+            sec._raw_header = data[sec_off:sec_off + SECTION_HEADER_SIZE]
+            sec._raw_body = data[sec_off + SECTION_HEADER_SIZE:sec_off + size]
 
-    def _parse_section(self, section_meta: SectionMeta) -> Section:
-        _, section_offset, _, section_size, _ = section_meta
+            count = _u32(data, sec_off + SECTION_ENTRY_COUNT_OFFSET)
+            idx = sec_off + SECTION_HEADER_SIZE
+            for _ in range(count):
+                entry_id = _u32(data, idx)
+                value_offset = _u32(data, idx + 4)
+                value_length = _u32(data, idx + 8)
+                idx += SECTION_INDEX_ENTRY_SIZE
+                value = _decode_value(data, etype, sec_off + value_offset, value_length)
+                sec.entries.append([entry_id, value])
 
-        section_name = _decode_c_string(
-            self.d,
-            section_offset,
-            SECTION_NAME_SIZE,
-        )
-        element_type = _decode_c_string(
-            self.d,
-            section_offset + SECTION_TYPE_OFFSET,
-            SECTION_TYPE_SIZE,
-        )
+            self.sections.append(sec)
+            self._orig_meta.append((index, sec_off))
 
-        section = Section(section_name, element_type)
-        section._raw_header = self.d[section_offset: section_offset + SECTION_HEADER_SIZE]
-        section._raw_body = self.d[section_offset + SECTION_HEADER_SIZE: section_offset + section_size]
-
-        entry_count = _u32(self.d, section_offset + SECTION_ENTRY_COUNT_OFFSET)
-        index_offset = section_offset + SECTION_HEADER_SIZE
-
-        for _ in range(entry_count):
-            entry_id = _u32(self.d, index_offset)
-            value_offset = _u32(self.d, index_offset + 4)
-            value_length = _u32(self.d, index_offset + 8)
-            index_offset += SECTION_INDEX_ENTRY_SIZE
-
-            value = self._decode_value(
-                element_type,
-                section_offset + value_offset,
-                value_length,
-            )
-            section.entries.append([entry_id, value])
-
-        return section
-
-    def _decode_value(self, element_type: str, value_offset: int, value_length: int) -> Any:
-        if element_type == UTF8_TYPE:
-            return self.d[value_offset: value_offset + value_length].decode(
-                "utf-8",
-                DECODE_ERRORS,
-            )
-
-        if element_type == UTF16LE_TYPE:
-            return self.d[value_offset: value_offset + value_length].decode(
-                UTF16LE_ENCODING,
-                DECODE_ERRORS,
-            )
-
-        _, scalar_format = _SCALAR_TYPES.get(element_type, DEFAULT_SCALAR)
-        return struct.unpack_from(scalar_format, self.d, value_offset)[0]
-
-    @staticmethod
-    def _pad_to_offset(output: bytearray, target_offset: int) -> None:
-        if len(output) < target_offset:
-            output += b"\x00" * (target_offset - len(output))
+    # -- lookup -----------------------------------------------------------
+    def __contains__(self, name: str) -> bool:
+        return any(s.name == name for s in self.sections)
 
     def get(self, name: str) -> Section:
-        for section in self.sections:
-            if section.name == name:
-                return section
-
+        for s in self.sections:
+            if s.name == name:
+                return s
         raise KeyError(name)
 
+    def section_names(self) -> list[str]:
+        return [s.name for s in self.sections]
+
     def read(self, name: str) -> dict[int, Any]:
-        return {entry_id: value for entry_id, value in self.get(name).entries}
+        """Return ``{id: value}`` for a section."""
+        return self.get(name).as_dict()
 
+    def ids(self, name: str) -> list[int]:
+        return self.get(name).ids()
+
+    def value(self, name: str, entry_id: int, default: Any = None) -> Any:
+        return self.get(name).value(entry_id, default)
+
+    # -- editing ----------------------------------------------------------
+    def set(self, name: str, entry_id: int, value: Any) -> None:
+        """Convenience: ``t.set("WordList", 29, "新語")``."""
+        self.get(name).set_value(entry_id, value)
+
+    # -- building / saving ------------------------------------------------
     def build(self) -> bytes:
-        output = bytearray(self._file_header)
+        out = bytearray(self._file_header)
 
-        self._pad_to_offset(output, self._sec_off)
+        # pad to the section table position, then reserve the table
+        if len(out) < self._table_offset:
+            out += b"\x00" * (self._table_offset - len(out))
+        table_pos = len(out)
+        out += b"\x00" * (SECTION_TABLE_ENTRY_SIZE * len(self.sections))
 
-        section_table_position = len(output)
-        output += b"\x00" * (SECTION_TABLE_ENTRY_SIZE * len(self.sections))
+        rebuilt_meta: list[tuple[int, int, int]] = []   # (orig_index, offset, size)
+        for i, sec in enumerate(self.sections):
+            orig_index, orig_offset = self._orig_meta[i]
+            # preserve each section's original start offset where possible
+            if len(out) < orig_offset:
+                out += b"\x00" * (orig_offset - len(out))
+            sec_offset = len(out)
+            block = sec.to_bytes()
+            out += block
+            rebuilt_meta.append((orig_index, sec_offset, len(block)))
 
-        rebuilt_meta = []
+        # write the section table
+        pos = table_pos
+        for orig_index, sec_offset, size in rebuilt_meta:
+            struct.pack_into("<IIIII", out, pos,
+                             orig_index, sec_offset, SECTION_TABLE_HEADER_SIZE, size, size)
+            pos += SECTION_TABLE_ENTRY_SIZE
 
-        for section_index, section in enumerate(self.sections):
-            original_section_offset = self._sec_meta[section_index][1]
-            self._pad_to_offset(output, original_section_offset)
-
-            section_offset = len(output)
-            section_block = _section_bytes(section)
-            output += section_block
-
-            original_section_index = self._sec_meta[section_index][0]
-            rebuilt_meta.append(
-                (
-                    original_section_index,
-                    section_offset,
-                    SECTION_TABLE_HEADER_SIZE,
-                    len(section_block),
-                    len(section_block),
-                )
-            )
-
-        _write_section_table(output, section_table_position, rebuilt_meta)
-
-        if self.path:
-            self._pad_to_offset(output, len(self.d))
-
-        return bytes(output)
+        # pad to the original total length (the game expects a fixed-size file)
+        if len(out) < len(self._original):
+            out += b"\x00" * (len(self._original) - len(out))
+        return bytes(out)
 
     def save(self, path: str | Path) -> None:
-        _write_file(path, self.build())
+        Path(path).write_bytes(self.build())
 
+    def round_trips(self) -> bool:
+        """True if rebuilding an unmodified file reproduces the input byte-for-byte."""
+        return self.build() == self._original
+
+    # -- creation ---------------------------------------------------------
+    @classmethod
+    def from_template(cls, path: str | Path) -> "Tr2":
+        """Load ``path`` but clear every section's entries, giving you an empty
+        file with the exact same section names / types / placement to populate."""
+        t = cls(path)
+        for sec in t.sections:
+            sec.entries = []
+            sec.dirty = True
+        return t
+
+    # -- reporting --------------------------------------------------------
     def summary(self) -> None:
-        print(f"== {self.path} name={self.name!r} sections={len(self.sections)} ==")
+        print(f"== {self.name!r}  sections={len(self.sections)}  size={len(self._original)} ==")
+        for s in self.sections:
+            print(f"  {s.name:34s} {s.etype:9s} entries={len(s.entries)}")
 
-        for section in self.sections:
-            print(f"  {section.name:34s} {section.etype:9s} entries={len(section.entries)}")
+    def __repr__(self) -> str:
+        return f"<Tr2 {self.name!r} sections={len(self.sections)}>"
 
 
-# noinspection PyTypeChecker
+# ---------------------------------------------------------------------------
+# Misc.tr2 word-list convenience layer
+# ---------------------------------------------------------------------------
 def load_words(path: str | Path = "Misc.tr2") -> list[dict[str, Any]]:
-    tr2_file = Tr2(path)
-
-    words = tr2_file.read("WordList")
-    yomi = tr2_file.read("YOMI")
-    hits = tr2_file.read("SINGLEHITS")
-    ranks: dict[int, Any] = tr2_file.read("WORD_RANK")
-
+    """Join Misc.tr2's parallel sections into a list of word records."""
+    t = Tr2(path)
+    words = t.read("WordList")
+    yomi = t.read("YOMI")
+    hits = t.read("SINGLEHITS") if "SINGLEHITS" in t else {}
+    ranks = t.read("WORD_RANK") if "WORD_RANK" in t else {}
     return [
         {
-            "id": word_id,
-            "term": words[word_id],
-            "yomi": yomi.get(word_id, ""),
-            "single_hits": hits.get(word_id),
-            "rank": WORD_RANK_LABELS.get(ranks.get(word_id), ranks.get(word_id)),
+            "id": wid,
+            "term": words[wid],
+            "yomi": yomi.get(wid, ""),
+            "single_hits": hits.get(wid),
+            "rank": WORD_RANK_LABELS.get(ranks.get(wid), ranks.get(wid)),
         }
-        for word_id in sorted(words)
+        for wid in sorted(words)
     ]
 
-def dump_words(path: str | Path = "Misc.tr2") -> None:
-    import json
 
-    words = load_words(path)
-    with open("words.json", "w", encoding="utf-8") as f:
-        json.dump(words, f, ensure_ascii=False, indent=2)
-
-def TR2(path: str | Path) -> Tr2:
-    return Tr2(path)
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) > 1:
+        Tr2(sys.argv[1]).summary()
+    else:
+        print(__doc__)
