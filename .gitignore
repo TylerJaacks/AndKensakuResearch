@@ -222,3 +222,5 @@ __marimo__/
 
 chats/
 words.json
+/dotch.tsv
+/misc.tsv
