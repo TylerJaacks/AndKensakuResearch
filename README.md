@@ -5,3 +5,7 @@ Reverse engineering the Japanese exclusive Wii game [And-Kensaku](https://ninten
 
 # TR2 File Format
 [Here](/docs/TR2.md)
+
+# CREDITS
+
+Claude helped a lot during this process (Yeah, yeah shut up. I know how to code).
