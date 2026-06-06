@@ -97,10 +97,17 @@ LEGAL_YOMI_CHARS = frozenset(
     "ゃゅょ"
     # small tsu
     "っ"
-    # small vowels (rare in readings but legal)
+    # small vowels
     "ぁぃぅぇぉ"
+    # modern hiragana variants for foreign loanwords
+    "ゔゎ"        # ゔ (vu) and ゎ (small wa) — both used in shipping YOMI
     # long vowel mark
     "ー"
+    # delimiters/separators the shipping game uses in YOMI
+    "/"           # alternation between alt readings (e.g. にほん/にっぽん)
+    "・"          # foreign-word separator (さぐらだ・ふぁみりあ)
+    "＝"          # compound foreign name separator (もん・さん＝みしぇる)
+    "～"          # casual emphasis (しんじられな～い)
 )
 
 
@@ -219,18 +226,23 @@ def _plan_misc_edits(orig: Tr2, edits: list[dict]) -> tuple[list[dict], list[str
         if wid not in yo_ids:
             errors.append(f"row {row}: id {wid} not present in YOMI")
             continue
+        # Skip no-op rows BEFORE per-row content validation. The game already
+        # accepts whatever's in its own data; a TSV row identical to the
+        # original is a pass-through and we don't second-guess it.
+        if word == wl_orig[wid] and yomi == yo_orig[wid]:
+            continue
         if word == "":
             errors.append(f"row {row}: word is empty for id {wid}")
             continue
         if yomi == "":
             errors.append(f"row {row}: yomi is empty for id {wid}")
             continue
-        bad = illegal_chars(yomi)
-        if bad:
-            errors.append(f"row {row}: yomi {yomi!r} for id {wid} contains illegal chars: {bad}")
-            continue
-        if word == wl_orig[wid] and yomi == yo_orig[wid]:
-            continue   # no-op row
+        # Legal-char check applies ONLY when yomi is actually changing.
+        if yomi != yo_orig[wid]:
+            bad = illegal_chars(yomi)
+            if bad:
+                errors.append(f"row {row}: yomi {yomi!r} for id {wid} contains illegal chars: {bad}")
+                continue
         effective.append(rec)
 
     # Dictionary uniqueness: no exact (yomi, word) pair may be duplicated in
@@ -306,25 +318,45 @@ def cmd_export_misc(args) -> int:
 # ---------------------------------------------------------------------------
 # DOTCH edits
 # ---------------------------------------------------------------------------
-DOTCH_HEADER = ["id", "question", "select1", "select2"]
-DOTCH_SECTIONS = ("502_DOTCH_QUESTION", "502_DOTCH_SELECT1", "502_DOTCH_SELECT2")
+DOTCH_HEADER = ["id", "question", "select1", "select2", "hits1", "hits2"]
+DOTCH_TEXT_SECTIONS = ("502_DOTCH_QUESTION", "502_DOTCH_SELECT1", "502_DOTCH_SELECT2")
+DOTCH_HIT_SECTIONS = ("502_DOTCH_HIT1", "502_DOTCH_HIT2")
+DOTCH_SECTIONS = DOTCH_TEXT_SECTIONS + DOTCH_HIT_SECTIONS
+# field name in the TSV -> section name in the .tr2
+DOTCH_FIELD_TO_SECTION = {
+    "question": "502_DOTCH_QUESTION",
+    "select1":  "502_DOTCH_SELECT1",
+    "select2":  "502_DOTCH_SELECT2",
+    "hits1":    "502_DOTCH_HIT1",
+    "hits2":    "502_DOTCH_HIT2",
+}
+DOTCH_TEXT_FIELDS = ("question", "select1", "select2")
+DOTCH_HIT_FIELDS = ("hits1", "hits2")
 
 
 def export_dotch(src: Path, out: Path) -> int:
     t = Tr2(src)
-    q = t.get("502_DOTCH_QUESTION").as_dict()
-    s1 = t.get("502_DOTCH_SELECT1").as_dict()
-    s2 = t.get("502_DOTCH_SELECT2").as_dict()
-    if not (set(q) == set(s1) == set(s2)):
+    sec = {name: t.get(name).as_dict() for name in DOTCH_SECTIONS}
+    id_sets = [set(d) for d in sec.values()]
+    if any(s != id_sets[0] for s in id_sets[1:]):
         raise RuntimeError(f"{src}: DOTCH parallel sections have mismatched id sets — refusing")
-    rows = [[str(i), q[i], s1[i], s2[i]] for i in sorted(q)]
+    rows = []
+    for i in sorted(id_sets[0]):
+        rows.append([
+            str(i),
+            sec["502_DOTCH_QUESTION"][i],
+            sec["502_DOTCH_SELECT1"][i],
+            sec["502_DOTCH_SELECT2"][i],
+            str(sec["502_DOTCH_HIT1"][i]),
+            str(sec["502_DOTCH_HIT2"][i]),
+        ])
     write_tsv(out, DOTCH_HEADER, rows)
     return len(rows)
 
 
 def _plan_dotch_edits(orig: Tr2, edits: list[dict]) -> tuple[list[dict], list[str]]:
     orig_vals = {name: orig.get(name).as_dict() for name in DOTCH_SECTIONS}
-    valid_ids = set(orig_vals[DOTCH_SECTIONS[0]])
+    valid_ids = set(orig_vals[DOTCH_TEXT_SECTIONS[0]])
 
     errors: list[str] = []
     effective: list[dict] = []
@@ -335,11 +367,33 @@ def _plan_dotch_edits(orig: Tr2, edits: list[dict]) -> tuple[list[dict], list[st
         if eid not in valid_ids:
             errors.append(f"row {row}: id {eid} not present in DOTCH sections")
             continue
-        # empty/non-empty parity per section
+
+        # Parse hit values to int up front (TSV stores them as strings).
+        try:
+            rec["hits1"] = int(rec["hits1"])
+            rec["hits2"] = int(rec["hits2"])
+        except ValueError:
+            errors.append(f"row {row}: hits1/hits2 must be integers, got {rec['hits1']!r}/{rec['hits2']!r}")
+            continue
+
+        # Skip no-op rows before content validation.
+        unchanged_text = all(
+            rec[f] == orig_vals[DOTCH_FIELD_TO_SECTION[f]][eid] for f in DOTCH_TEXT_FIELDS
+        )
+        unchanged_hits = all(
+            rec[f] == orig_vals[DOTCH_FIELD_TO_SECTION[f]][eid] for f in DOTCH_HIT_FIELDS
+        )
+        if unchanged_text and unchanged_hits:
+            continue
+
+        # Text parity check — only for fields that changed
         parity_ok = True
-        for src_field, sec_name in zip(("question", "select1", "select2"), DOTCH_SECTIONS):
-            new_v = rec[src_field]
+        for field in DOTCH_TEXT_FIELDS:
+            sec_name = DOTCH_FIELD_TO_SECTION[field]
+            new_v = rec[field]
             orig_v = orig_vals[sec_name][eid]
+            if new_v == orig_v:
+                continue
             if (orig_v == "") != (new_v == ""):
                 errors.append(
                     f"row {row}: id {eid} {sec_name} empty/non-empty parity broken "
@@ -348,11 +402,29 @@ def _plan_dotch_edits(orig: Tr2, edits: list[dict]) -> tuple[list[dict], list[st
                 parity_ok = False
         if not parity_ok:
             continue
-        # is it a real change?
-        if (rec["question"] == orig_vals["502_DOTCH_QUESTION"][eid]
-                and rec["select1"] == orig_vals["502_DOTCH_SELECT1"][eid]
-                and rec["select2"] == orig_vals["502_DOTCH_SELECT2"][eid]):
+
+        # Hit range checks — only enforce on changed values
+        hit_ok = True
+        for field in DOTCH_HIT_FIELDS:
+            new_v = rec[field]
+            orig_v = orig_vals[DOTCH_FIELD_TO_SECTION[field]][eid]
+            if new_v == orig_v:
+                continue
+            if new_v < 0:
+                errors.append(f"row {row}: id {eid} {field} must be >= 0, got {new_v}")
+                hit_ok = False
+        if not hit_ok:
             continue
+
+        # Tie check — shipping data has zero ties (verified across 523 entries),
+        # so tie-handling is untested territory. Block by default.
+        if rec["hits1"] == rec["hits2"]:
+            errors.append(
+                f"row {row}: id {eid} hits1 == hits2 == {rec['hits1']} (tie) — shipping data "
+                f"has no ties; behavior unverified. Adjust one side by at least 1."
+            )
+            continue
+
         effective.append(rec)
     return effective, errors
 
@@ -369,14 +441,15 @@ def cmd_apply_dotch(args) -> int:
     if args.dry_run:
         for rec in effective:
             print(f"  would change id={rec['id']}:")
-            for fld, sec in zip(("question", "select1", "select2"), DOTCH_SECTIONS):
+            for fld in DOTCH_TEXT_FIELDS + DOTCH_HIT_FIELDS:
+                sec = DOTCH_FIELD_TO_SECTION[fld]
                 ov = t.get(sec).value(rec["id"])
                 if ov != rec[fld]:
                     print(f"      {fld}: {ov!r} -> {rec[fld]!r}")
         return 0
     for rec in effective:
-        for fld, sec in zip(("question", "select1", "select2"), DOTCH_SECTIONS):
-            t.get(sec).set_value(rec["id"], rec[fld])
+        for fld in DOTCH_TEXT_FIELDS + DOTCH_HIT_FIELDS:
+            t.get(DOTCH_FIELD_TO_SECTION[fld]).set_value(rec["id"], rec[fld])
     atomic_write_bytes(out, t.build())
     print(f"wrote {out} ({out.stat().st_size} bytes, {len(effective)} entries changed)")
     return 0
