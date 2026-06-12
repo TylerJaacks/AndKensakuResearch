@@ -12,8 +12,10 @@ Reverse engineering the Japanese exclusive Wii game [And-Kensaku (安藤ケン�
 
 ![image](https://static.wikitide.net/wuhupediawiki/b/b4/And-Kensaku.png)
 
-# TR2 File Format
-[Here](/docs/TR2.md)
+# Documentation
+- [TR2](/docs/TR2.md)
+- [Gamemodes](/docs/GAMEMODES.md)
+
 
 # PATCHES
 
